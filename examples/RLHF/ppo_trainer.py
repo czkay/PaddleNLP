@@ -22,10 +22,12 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import paddle
+import paddle.distributed as dist
 import paddle.nn as nn
 import paddle.nn.functional as F
 import tqdm
 from data import DummyDataset, PromptOnlyBatch
+from paddle.distributed import fleet
 from paddle.io import DataLoader, Dataset, DistributedBatchSampler
 from paddle.utils import map_structure
 from rich.console import Console
@@ -33,6 +35,7 @@ from rich.table import Table
 
 from paddlenlp.data import DataCollator
 from paddlenlp.generation import GenerationConfig
+from paddlenlp.trainer.plugins.unified_checkpoint import flatten_list
 from paddlenlp.trainer.trainer import (
     TRAINER_STATE_NAME,
     EvalLoopOutput,
@@ -59,6 +62,7 @@ from paddlenlp.transformers.tokenizer_utils_base import (
     PaddingStrategy,
     TruncationStrategy,
 )
+from paddlenlp.utils.distributed import distributed_gather
 
 
 def batch_retokenize(
@@ -470,10 +474,144 @@ def full_training_step(self: Trainer, inputs: Dict[str, paddle.Tensor], **kwargs
     return kwargs
 
 
+def offload_model(self: Trainer, **kwargs):
+    for k, v in self.model.state_dict():
+        v = paddle.copy_(v, paddle.CPUPlace())
+
+
+def reload_model(self: Trainer, **kwargs):
+    for k, v in self.model.state_dict():
+        v = paddle.copy_(v, paddle.GPUPlace())
+
+
+def export_evaluate_model(self: Trainer, train_model, eval_model, **kwargs):
+    with_offload = kwargs.pop("with_offload", False)
+    train_tp_size = max(train_model.config.tensor_parallel_dergee, 1)
+    eval_tp_size = max(eval_model.config.tensor_parallel_dergee, 1)
+
+    hcg = fleet.get_hybrid_communicate_group()
+    tp_group = hcg.get_model_parallel_group()
+    pp_group = hcg.get_pipe_parallel_group()
+    sd_group = hcg.get_sharding_parallel_group()
+    dp_group = hcg.get_data_parallel_group()
+
+    global_rank = paddle.distributed.get_rank()
+
+    if dp_group.rank == 0 and sd_group.rank == 0:
+        train_pp_size = pp_group.nranks
+        if eval_tp_size > 1 and train_tp_size != eval_tp_size:
+            raise ValueError("Only support for the same tensor_parallel_dergee for train and eval model for now.")
+
+        train_state_dict = train_model.state_dict()
+        eval_state_dict = eval_model.state_dict()
+
+        # 单卡情况
+        # tp->single
+        # tp+pp -> single
+        if eval_tp_size == 1:
+            if train_pp_size == 1 and train_tp_size > 1:
+                # tp ->singlei
+                # state = train_model.merge_tensor_parallel()
+                tp_actions = train_model._get_tensor_parallel_mappings(train_model.config, is_split=False)
+
+                is_dst = global_rank == 0
+                for key in eval_state_dict.keys():
+                    tensor = train_state_dict[key]
+                    if key in tp_actions:
+                        ret = distributed_gather(tensor, dst=0, group=tp_group, offload=False)
+                        action = tp_actions.pop(key)
+                        tensor = action(ret) if is_dst else None
+                    else:
+                        tensor = tensor._copy_to(paddle.CPUPlace(), False) if is_dst else None
+
+                    if tensor is not None:
+                        eval_state_dict[key].set_value(tensor)
+
+                    if with_offload:
+                        train_state_dict[key].copy_to(paddle.CPUPlace())
+            else:
+                # single to single
+                # tp+pp -> single
+                raise ValueError("Not support yet.")
+
+        def create_send_recv_table(all_keys, train_keys, eval_keys):
+            recv_table = []
+            send_table = []
+            if pp_group.rank == 0:
+                for key in eval_keys:
+                    recv_table.append((key, global_rank))
+
+            for key in train_keys:
+                recv_table.append((key, global_rank))
+
+            all_recv, all_send = [], []
+            paddle.distributed.all_gather_object(all_recv, [recv_table], group=pp_group)
+            paddle.distributed.all_gather_object(all_send, [send_table], group=pp_group)
+            all_recv = flatten_list(all_recv)
+            all_send = flatten_list(all_send)
+
+            send_dict = {}
+            for k, v in all_send:
+                send_dict[k] = v
+            table = []
+            for k, v in all_recv:
+                # key, send, recv
+                table.append([k, send_dict.pop(k), v])
+            assert len(send_dict) == 0, f"Some key can't be recv {send_dict.keys()}"
+            return table
+
+            # pp0tp0 -> pp0tp0
+            # pp0tp1 -> pp0tp1
+            # pp1tp0 -> pp0tp0
+            # pp1tp1 -> pp0tp1
+
+        # tp情况
+        # tp+pp->tp
+        if eval_tp_size > 1 and train_pp_size > 1:
+            table = create_send_recv_table(train_state_dict.keys(), eval_state_dict.keys())
+
+            for key, src_rank, dst_rank in table:
+                # Init tensor for model is cleaned
+                if global_rank == dst_rank and not eval_state_dict[key].is_initialized():
+                    eval_state_dict[key] = paddle.random()
+
+                if global_rank == src_rank:
+                    dist.stream.send(train_state_dict[key], dst=dst_rank)
+
+                if global_rank == dst_rank:
+                    dist.stream.recv(eval_state_dict[key], dst=dst_rank)
+
+                # Offload train model if need
+                if global_rank == src_rank and with_offload:
+                    train_state_dict[key].copy_to(paddle.CPUPlace())
+    else:
+        # 其他 DP rank 的state dict, 适配 offload 和初始化
+        if with_offload:
+            for k, v in train_state_dict.items():
+                v = v.copy_to(paddle.CPUPlace())
+        for k, v in eval_state_dict.items():
+            if not v.is_initialized():
+                v.set_value(paddle.random())
+
+    paddle.distributed.barrier()
+    if sd_group.nrank > 1:
+        paddle.distributed.parallel.sync_params_buffers(eval_model, comm_group=sd_group, fuse_params=False)
+    if dp_group.nrank > 1:
+        paddle.distributed.parallel.sync_params_buffers(eval_model, comm_group=dp_group, fuse_params=False)
+
+
+def cleanup_model(sefl: Trainer, **kwargs):
+    pass
+
+
 Trainer.init_train_model_opt = init_train_model_opt
 Trainer.init_train_log = init_train_log
 Trainer.init_train_state = init_train_state
 Trainer.full_training_step = full_training_step
+
+Trainer.offload = offload_model
+Trainer.reload = reload_model
+Trainer.export_evaluate_model = export_evaluate_model
 
 
 class PolicyTrainer(Trainer):
@@ -747,7 +885,10 @@ class PPOTrainer(Trainer):
         self.ptx_dataset = ptx_dataset
         self.eval_dataset = eval_dataset
 
-        (policy_model, reference_model, reward_model, value_model) = model
+        (policy_model, reference_model, reward_model, value_model, policy_model_eval, value_model_eval) = model
+        self._policy_model_eval = policy_model_eval
+        self._value_model_eval = value_model_eval
+
         # policy_tokenizer and value_tokenizer should be same
         (policy_tokenizer, reference_tokenizer, reward_tokenizer, value_tokenizer) = tokenizer
 
@@ -837,7 +978,7 @@ class PPOTrainer(Trainer):
             self.reward_tokenizer = self.tokenizer
 
         self.generation_config = GenerationConfig(
-            max_length=self.args.max_length,
+            max_new_tokens=self.args.max_length,
             num_return_sequences=self.args.num_return_sequences,
             temperature=self.args.temperature,
             top_p=self.args.top_p,
@@ -1088,12 +1229,32 @@ class PPOTrainer(Trainer):
             ):
                 # generate batches
                 self.set_eval()
+
+                policy_model_train = self.policy_trainer.model
+                policy_model_eval = self.policy_trainer.export_evaluate_model(
+                    policy_model_train, self._policy_model_eval, with_offload=False
+                )
+                self.optimizer.offload()
+                value_model_eval = self.value_trainer.export_evaluate_model(
+                    self.value_trainer.model, self._value_model_eval, with_offload=False
+                )
+
+                self.reference_model.reload()
+                self.reward_model.reload()
+
+                # 生成数据
                 rl_batches = self.split_rl_micro_batches(prompt_only_batch)
                 if self.use_ptx:
                     ptx_batches = self.split_ptx_micro_batches(ptx_batch)
                 else:
                     ptx_batches = [None for _ in range(len(rl_batches))]
                 paddle.device.cuda.empty_cache()
+
+                # 数据造好, 开始训练
+                self.reference_model.offload()
+                self.reward_model.offload()
+                policy_model_eval.cleanup()
+                value_model_eval.cleanup()
 
                 self.set_train()
                 for _ in range(self.args.update_iters):
@@ -1275,7 +1436,12 @@ class PPOTrainer(Trainer):
                 train_step_kwargs.update({"epoch": epoch, "step": step})
                 rl_batch, ptx_batch = inputs
                 # TODO(guosheng): make rl_step/ptx_step run with autocast_smart_context_manager
+
+                policy_model.reload()
+                value_model.reload()
+
                 rl_info, train_step_kwargs = self.rl_step(rl_batch, **train_step_kwargs)
+
                 paddle.device.cuda.empty_cache()
                 if self.use_ptx:
                     ptx_info, train_step_kwargs = self.ptx_step(ptx_batch, **train_step_kwargs)
