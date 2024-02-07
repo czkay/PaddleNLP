@@ -837,9 +837,9 @@ class LayoutXLMModel(LayoutXLMPretrainedModel):
 
 
 class LayoutXLMForTokenClassification(LayoutXLMPretrainedModel):
-    def __init__(self, config: LayoutXLMConfig):
+    def __init__(self, num_classes, config: LayoutXLMConfig):
         super(LayoutXLMForTokenClassification, self).__init__(config)
-        self.num_classes = config.num_labels
+        self.num_classes = num_classes
         self.layoutxlm = LayoutXLMModel(config)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.classifier = nn.Linear(config.hidden_size, self.num_classes)
